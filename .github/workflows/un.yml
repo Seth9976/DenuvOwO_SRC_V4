@@ -1,0 +1,141 @@
+# -----------------------------------------------------------------------------
+# 工作流目的说明：
+# 此工作流用于监听仓库 main 分支上常见压缩文件格式的推送事件。
+# 当检测到 .zip, .7z, .rar, .tar, .tar.gz, .tgz, .tar.bz2, .tar.xz 文件时，
+# 工作流会自动检出代码，安装必要的解压工具（如 7z 和 unrar），
+# 然后在文件各自所在的目录（原地）执行解压操作。
+# 解压完成后，强制将解压出的文件添加到 Git 暂存区（忽略 .gitignore 规则），
+# 删除原始压缩包，并将这些变更提交且推送到远程仓库。
+# -----------------------------------------------------------------------------
+
+name: 自动解压多种常见格式压缩包
+on:
+  push:
+    branches:
+      - main 
+    # 扩展路径触发器，使其监听多种常见的压缩包格式
+    paths:
+      - '**.zip'
+      - '**.7z'
+      - '**.rar'
+      - '**.tar'
+      - '**.tar.gz'
+      - '**.tgz'
+      - '**.tar.bz2'
+      - '**.tar.xz'
+  
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract_all_archives:
+    runs-on: ubuntu-22.04
+    if: github.actor != 'github-actions[bot]'
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装必要的解压依赖
+        run: |
+          # 更新包列表并安装 p7zip-full (用于 7z) 和 unrar (用于 rar)
+          # unzip 和 tar 通常在 ubuntu 镜像中已预装
+          sudo apt-get update -y
+          sudo apt-get install -y p7zip-full unrar
+
+      - name: 查找、原地解压、强制添加并删除压缩包
+        run: |
+          echo "开始查找仓库中的受支持压缩文件..."
+          
+          # 使用 find 命令匹配多种后缀名。使用 -iname 以忽略大小写 (例如匹配 .ZIP 和 .zip)
+          ARCHIVES=$(find . -type f \( -iname "*.zip" -o -iname "*.7z" -o -iname "*.rar" -o -iname "*.tar" -o -iname "*.tar.gz" -o -iname "*.tgz" -o -iname "*.tar.bz2" -o -iname "*.tar.xz" \) -not -path "./.git/*")
+
+          if [ -z "$ARCHIVES" ]; then
+            echo "未在此次检出的代码中找到支持的压缩文件。"
+            exit 0
+          fi
+
+          echo "找到以下压缩文件并准备处理:"
+          echo "$ARCHIVES"
+          echo "---"
+
+          echo "$ARCHIVES" | while read -r FILE; do
+            if [ -f "$FILE" ]; then
+              TARGET_DIR=$(dirname "$FILE")
+              FILENAME=$(basename "$FILE")
+              
+              # 将文件名转换为小写，方便统一匹配后缀
+              LOWER_FILE=$(echo "$FILENAME" | tr '[:upper:]' '[:lower:]')
+              
+              echo "正在处理: $FILE"
+              echo "  -> 解压到目标目录: $TARGET_DIR"
+              
+              # 根据文件后缀名执行不同的解压命令
+              case "$LOWER_FILE" in
+                *.zip)
+                  unzip -o "$FILE" -d "$TARGET_DIR"
+                  ;;
+                *.7z)
+                  # x 表示携带完整路径解压，-o 指定目录，-y 默认同意覆盖
+                  7z x "$FILE" -o"$TARGET_DIR" -y
+                  ;;
+                *.rar)
+                  # x 表示携带完整路径解压，-o+ 表示覆盖现有文件
+                  unrar x -o+ "$FILE" "$TARGET_DIR/"
+                  ;;
+                *.tar)
+                  tar -xf "$FILE" -C "$TARGET_DIR"
+                  ;;
+                *.tar.gz | *.tgz)
+                  tar -xzf "$FILE" -C "$TARGET_DIR"
+                  ;;
+                *.tar.bz2)
+                  tar -xjf "$FILE" -C "$TARGET_DIR"
+                  ;;
+                *.tar.xz)
+                  tar -xJf "$FILE" -C "$TARGET_DIR"
+                  ;;
+                *)
+                  echo "  -> 错误: 未知的文件扩展名 ($FILE)。此分支在理论上不应被触发。"
+                  exit 1
+                  ;;
+              esac
+              
+              # 检查上一步的解压命令是否执行成功
+              if [ $? -eq 0 ]; then
+                echo "  -> 解压成功。"
+                
+                # 强制暂存解压目录的内容，无视 .gitignore
+                echo "  -> 强制暂存 $TARGET_DIR 中的新文件..."
+                git add --force "$TARGET_DIR"
+
+                # 删除原始压缩文件
+                echo "  -> 正在删除: $FILE"
+                rm "$FILE"
+                
+                # 暂存删除操作
+                git add "$FILE"
+              else
+                echo "  -> 错误: 解压 $FILE 失败。"
+                exit 1
+              fi
+            fi
+          done
+          echo "---"
+          echo "所有受支持的压缩文件处理完毕。"
+
+      - name: 提交变动
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 检查暂存区是否有变动
+          if ! git diff --staged --quiet; then
+            echo "检测到暂存的变动，正在提交..."
+            git commit -m "Chore: 自动解压并删除多种格式压缩包"
+            git push
+          else
+            echo "没有文件变动需要提交。"
+          fi
